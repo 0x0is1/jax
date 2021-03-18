@@ -43,33 +43,6 @@ from ._src.pprint_util import pp, vcat, PrettyPrint
 from ._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
-# TODO(mattjj): move this into debug_state
-skip_checks = not FLAGS.jax_enable_checks
-
-@contextmanager
-def skipping_checks():
-  """Context manager for temporarily disabling internal checks."""
-  global skip_checks
-  old_value, skip_checks = skip_checks, True
-  try:
-    yield
-  finally:
-    skip_checks = old_value
-
-@contextmanager
-def checking_leaks():
-  """Context manager for temporarily enabling tracer leak checks."""
-  old_value, debug_state.check_leaks = debug_state.check_leaks, True
-  try:
-    yield
-  finally:
-    debug_state.check_leaks = old_value
-
-class DebugState(threading.local):
-  def __init__(self):
-    self.check_leaks = FLAGS.jax_check_tracer_leaks
-debug_state = DebugState()
-
 zip = safe_zip
 map = safe_map
 
@@ -277,8 +250,8 @@ class Primitive:
 
 
   def bind(self, *args, **params):
-    assert skip_checks or all(isinstance(arg, Tracer)
-                              or valid_jaxtype(arg) for arg in args), args
+    assert (not config.jax_enable_checks or
+            all(isinstance(arg, Tracer) or valid_jaxtype(arg) for arg in args)), args
     top_trace = find_top_trace(args)
     tracers = map(top_trace.full_raise, args)
     out = top_trace.process_primitive(self, tracers, params)
@@ -567,7 +540,7 @@ class Tracer:
 
   def __getattr__(self, name):
     # if the aval property raises an AttributeError, gets caught here
-    assert skip_checks or name != "aval"
+    assert not config.jax_enable_checks or name != "aval"
 
     try:
       attr = getattr(self.aval, name)
@@ -754,7 +727,7 @@ def new_main(trace_type: Type[Trace],
     if dynamic:
       stack.dynamic = prev_dynamic
 
-  if debug_state.check_leaks:
+  if config.jax_check_tracer_leaks:
     t = ref(main)
     del main
     if t() is not None:
@@ -773,7 +746,7 @@ def new_base_main(trace_type: Type[Trace]) -> Generator[MainTrace, None, None]:
     stack.dynamic = prev_dynamic
     stack.stack[0] = prev_base
 
-  if debug_state.check_leaks:
+  if config.jax_check_tracer_leaks:
     t = ref(main)
     del main
     if t() is not None:
@@ -794,7 +767,7 @@ def new_sublevel() -> Generator[None, None, None]:
     thread_local_state.trace_state.substack.pop()
 
   # TODO(mattjj): to check sublevel leaks, we need to make Sublevel weakref-able
-  # if debug_state.check_leaks:
+  # if config.jax_check_tracer_leaks:
   #   t = ref(sublevel)
   #   del sublevel
   #   if t() is not None:
@@ -866,7 +839,7 @@ class AbstractUnit(AbstractValue):
   # _num_buffers = 0
   def at_least_vspace(self): return self
   def join(self, other):
-    if not skip_checks:
+    if config.jax_enable_checks:
       assert other is abstract_unit, other
     return self
   def _eq(self, self_traced, other): return get_aval(other) is self
@@ -1894,7 +1867,7 @@ def omnistaging_disabler() -> None:
     finally:
       thread_local_state.trace_state.trace_stack.pop(bottom)
 
-    if debug_state.check_leaks:
+    if config.jax_check_tracer_leaks:
       t = ref(main)
       del main
       if t() is not None:
@@ -1911,7 +1884,7 @@ def omnistaging_disabler() -> None:
     yield  # dummy implementation for forward compatibility
 
   def bind(self, *args, **kwargs):
-    assert skip_checks or all(isinstance(arg, Tracer)
+    assert not config.jax_enable_checks or all(isinstance(arg, Tracer)
                               or valid_jaxtype(arg) for arg in args), args
     top_trace = find_top_trace(args)
     if top_trace is None:

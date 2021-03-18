@@ -41,7 +41,7 @@ from . import lib
 from . import linear_util as lu
 from . import ad_util
 from . import dtypes
-from .core import eval_jaxpr, checking_leaks
+from .core import eval_jaxpr
 from .api_util import (flatten_fun, apply_flat_fun, flatten_fun_nokwargs,
                        flatten_fun_nokwargs2, argnums_partial,
                        argnums_partial_except, flatten_axes, donation_vector,
@@ -354,7 +354,7 @@ def _cpp_jit(
   @api_boundary
   def f_jitted(*args, **kwargs):
     # TODO(jblespiau): We can remove `config.x64_enabled` when jaxlib 0.1.62 is
-    # the minimal version.
+    # the minimal version. NOTE(mattjj): minversion 0.1.62 didn't work...
     context = (getattr(core.thread_local_state.trace_state.trace_stack,
                        "dynamic", None), config.x64_enabled)
     # TODO(jblespiau): Move this to C++.

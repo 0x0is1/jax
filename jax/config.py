@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import functools
 import os
 import sys
+import threading
+
 from jax import lib
 
 def bool_env(varname: str, default: bool) -> bool:
@@ -47,6 +51,8 @@ class Config:
     self.meta = {}
     self.FLAGS = NameSpace(self.read)
     self.use_absl = False
+
+    # TODO(mattjj): delete these when only omnistaging is available
     self.omnistaging_enabled = bool_env('JAX_OMNISTAGING', True)
     self._omnistaging_disablers = []
 
@@ -143,14 +149,88 @@ class Config:
         disabler()
       self.omnistaging_enabled = False
 
+  # TODO(jakevdp, mattjj): unify this with `define_bool_state` stuff below
   @property
   def x64_enabled(self):
     return lib.jax_jit.get_enable_x64()
 
-  # TODO(jakevdp): make this public when thread-local x64 is fully implemented.
   def _set_x64_enabled(self, state):
     lib.jax_jit.thread_local_state().enable_x64 = bool(state)
 
+  def define_bool_state(self, name: str, default: bool, help: str):
+    """Set up thread-local state and return a contextmanager for managing it.
+
+    This function is a convenience wrapper. It defines a flag and corresponding
+    thread-local state, which can be managed via the contextmanager it returns.
+
+    The thread-local state value can be read via the ``config.<option_name>``
+    attribute, where ``config`` is the singleton ``Config`` instance.
+
+    Args:
+      name: string, converted to lowercase to define the name of the config
+        option (and absl flag). It is converted to uppercase to define the
+        corresponding shell environment variable.
+      default: boolean, a default value for the option.
+      help: string, used to populate the flag help information as well as the
+        docstring of the returned context manager.
+
+    Returns:
+      A contextmanager to control the thread-local state value.
+
+    Example:
+
+      enable_foo = config.define_bool_state(
+          name='jax_enable_foo',
+          default=False,
+          help='Enable foo.')
+
+      # Now the JAX_ENABLE_FOO shell environment variable and --jax_enable_foo
+      # command-line flag can be used to control the process-level value of
+      # the configuration option, in addition to using e.g.
+      # ``config.update("jax_enable_foo", True)`` directly. We can also use a
+      # context manager:
+
+      with enable_foo(True):
+        ...
+
+    Accessing ``config.FLAGS.jax_enable_foo`` is different from accessing the
+    thread-local state value via ``config.jax_enable_foo``: the former reads the
+    flag value determined set by the environment variable or command-line flag
+    and does not read the thread-local state, whereas the latter reads the
+    thread-local state value managed by the contextmanager. Think of the
+    contextmanager state as a layer on top of the flag value: if no
+    contextmanager is in use then ``config.jax_enable_foo`` reflects the flag
+    value ``config.FLAGS.jax_enable_foo``, whereas if a contextmanager is in use
+    then only ``config.jax_enable_foo`` is updated. So in general using
+    ``config.jax_enable_foo`` is best.
+    """
+    name = name.lower()
+    self.DEFINE_bool(name, bool_env(name.upper(), default), help)
+
+    def get_state(self):
+      val = getattr(_thread_local_state, name, unset)
+      return val if val is not unset else self.read(name)
+    setattr(Config, name, property(get_state))
+
+    @contextlib.contextmanager
+    def set_state(new_val: bool):
+      prev_val = getattr(_thread_local_state, name, unset)
+      setattr(_thread_local_state, name, new_val)
+      try:
+        yield
+      finally:
+        if prev_val is unset:
+          delattr(_thread_local_state, name)
+        else:
+          setattr(_thread_local_state, name, prev_val)
+    set_state.__name__ = name[4:] if name.startswith('jax_') else name
+    set_state.__doc__ = f"Context manager for `{name}` config option.\n\n{help}"
+    return set_state
+
+_thread_local_state = threading.local()
+
+class Unset: pass
+unset = Unset()
 
 class NameSpace(object):
   def __init__(self, getter):
@@ -166,11 +246,6 @@ FLAGS = flags.FLAGS
 
 already_configured_with_absl = False
 
-flags.DEFINE_bool(
-    'jax_enable_checks',
-    bool_env('JAX_ENABLE_CHECKS', False),
-    help='Turn on invariant checking (core.skip_checks = False)'
-)
 
 flags.DEFINE_bool(
     'jax_omnistaging',
@@ -184,10 +259,40 @@ flags.DEFINE_integer(
     help='Set the number of stack frames in JAX tracer error messages.'
 )
 
-flags.DEFINE_bool(
-    'jax_check_tracer_leaks',
-    bool_env('JAX_CHECK_TRACER_LEAKS', False),
+
+enable_checks = config.define_bool_state(
+    name='jax_enable_checks',
+    default=False,
+    help='Turn on invariant checking for JAX internals. Makes things slower.')
+
+check_tracer_leaks = config.define_bool_state(
+    name='jax_check_tracer_leaks',
+    default=False,
     help=('Turn on checking for leaked tracers as soon as a trace completes. '
           'Enabling leak checking may have performance impacts: some caching '
-          'is disabled, and other overheads may be added.'),
-)
+          'is disabled, and other overheads may be added.'))
+checking_leaks = functools.partial(check_tracer_leaks, True)
+
+debug_nans = config.define_bool_state(
+    name='jax_debug_nans',
+    default=False,
+    help=('Add nan checks to every operation. When a nan is detected on the '
+          'output of a jit-compiled computation, call into the un-compiled '
+          'version in an attempt to more precisely identify the operation '
+          'which produced the nan.'))
+
+debug_infs = config.define_bool_state(
+    name='jax_debug_infs',
+    default=False,
+    help=('Add inf checks to every operation. When an inf is detected on the '
+          'output of a jit-compiled computation, call into the un-compiled '
+          'version in an attempt to more precisely identify the operation '
+          'which produced the inf.'))
+
+log_compiles = config.define_bool_state(
+    name='jax_log_compiles',
+    default=False,
+    help=('Log a message each time every time `jit` or `pmap` compiles an XLA '
+          'computation. Logging is performed with `absl.logging`. When this '
+          'option is set, the log level is WARNING; otherwise the level is '
+          'DEBUG.'))
